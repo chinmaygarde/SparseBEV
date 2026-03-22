@@ -1,0 +1,44 @@
+[project]
+name = "sparsebev"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.3",
+    "onnx>=1.20.1",
+    "onnxruntime>=1.16",
+    "setuptools>=40,<72",  # <72 required: mmcv setup.py uses pkg_resources removed in >=72
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+    # mmdet ecosystem — old packages with stale pins, needs --no-build-isolation
+    "mmdet==2.28.2",
+    "mmsegmentation==0.30.0",
+    "mmdet3d==1.0.0rc6",
+    "mmcv==1.7.0",
+    "fvcore>=0.1.5.post20221221",
+    "einops>=0.8.2",
+    "onnxscript>=0.6.2",
+]
+
+[tool.uv]
+# Build mmcv/mmdet without isolation so they see the pinned setuptools<72
+# (they import pkg_resources in setup.py which was removed in setuptools>=72)
+no-build-isolation-package = ["mmcv", "mmdet", "mmdet3d", "mmsegmentation"]
+
+# mmdet3d==1.0.0rc6 has stale pins that conflict with Python 3.12 and modern torch.
+# Override to compatible modern versions.
+override-dependencies = [
+    "networkx>=2.5.1",
+    # mmdet3d pins numba==0.53.0 -> llvmlite==0.36.0 which only supports Python<3.10
+    "numba>=0.60.0",
+    "llvmlite>=0.43.0",
+    # setuptools>=72 removed pkg_resources as a top-level module; mmcv setup.py needs it
+    "setuptools<72",
+]
+
+[tool.uv.extra-build-dependencies]
+# mmdet3d/mmdet need torch at build time (they import it in setup.py)
+mmdet3d = ["torch"]
+mmdet = ["torch"]
+mmcv = ["setuptools"]

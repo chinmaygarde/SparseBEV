@@ -56,18 +56,23 @@ class SparseBEVTransformerDecoder(BaseModule):
     def forward(self, query_bbox, query_feat, mlvl_feats, attn_mask, img_metas):
         cls_scores, bbox_preds = [], []
 
-        # calculate time difference according to timestamps
-        timestamps = np.array([m['img_timestamp'] for m in img_metas], dtype=np.float64)
-        timestamps = np.reshape(timestamps, [query_bbox.shape[0], -1, 6])
-        time_diff = timestamps[:, :1, :] - timestamps
-        time_diff = np.mean(time_diff, axis=-1).astype(np.float32)  # [B, F]
-        time_diff = torch.from_numpy(time_diff).to(query_bbox.device)  # [B, F]
-        img_metas[0]['time_diff'] = time_diff
+        if isinstance(img_metas[0].get('time_diff'), torch.Tensor):
+            # ONNX export path: tensors pre-computed and injected by the wrapper
+            pass  # time_diff and lidar2img already set in img_metas[0]
+        else:
+            # Standard path: extract from img_metas using numpy
+            # calculate time difference according to timestamps
+            timestamps = np.array([m['img_timestamp'] for m in img_metas], dtype=np.float64)
+            timestamps = np.reshape(timestamps, [query_bbox.shape[0], -1, 6])
+            time_diff = timestamps[:, :1, :] - timestamps
+            time_diff = np.mean(time_diff, axis=-1).astype(np.float32)  # [B, F]
+            time_diff = torch.from_numpy(time_diff).to(query_bbox.device)  # [B, F]
+            img_metas[0]['time_diff'] = time_diff
 
-        # organize projections matrix and copy to CUDA
-        lidar2img = np.asarray([m['lidar2img'] for m in img_metas]).astype(np.float32)
-        lidar2img = torch.from_numpy(lidar2img).to(query_bbox.device)  # [B, N, 4, 4]
-        img_metas[0]['lidar2img'] = lidar2img
+            # organize projections matrix and copy to CUDA
+            lidar2img = np.asarray([m['lidar2img'] for m in img_metas]).astype(np.float32)
+            lidar2img = torch.from_numpy(lidar2img).to(query_bbox.device)  # [B, N, 4, 4]
+            img_metas[0]['lidar2img'] = lidar2img
 
         # group image features in advance for sampling, see `sampling_4d` for more details
         for lvl, feat in enumerate(mlvl_feats):
@@ -178,9 +183,11 @@ class SparseBEVTransformerDecoderLayer(BaseModule):
         # calculate absolute velocity according to time difference
         time_diff = img_metas[0]['time_diff']  # [B, F]
         if time_diff.shape[1] > 1:
-            time_diff = time_diff.clone()
-            time_diff[time_diff < 1e-5] = 1.0
-            bbox_pred[..., 8:] = bbox_pred[..., 8:] / time_diff[:, 1:2, None]
+            time_diff = torch.where(time_diff < 1e-5, torch.ones_like(time_diff), time_diff)
+            bbox_pred = torch.cat([
+                bbox_pred[..., :8],
+                bbox_pred[..., 8:] / time_diff[:, 1:2, None],
+            ], dim=-1)
 
         if DUMP.enabled:
             query_bbox_dec = decode_bbox(query_bbox, self.pc_range)
@@ -236,16 +243,8 @@ class SparseBEVSelfAttention(BaseModule):
     @torch.no_grad()
     def calc_bbox_dists(self, bboxes):
         centers = decode_bbox(bboxes, self.pc_range)[..., :2]  # [B, Q, 2]
-
-        dist = []
-        for b in range(centers.shape[0]):
-            dist_b = torch.norm(centers[b].reshape(-1, 1, 2) - centers[b].reshape(1, -1, 2), dim=-1)
-            dist.append(dist_b[None, ...])
-
-        dist = torch.cat(dist, dim=0)  # [B, Q, Q]
-        dist = -dist
-
-        return dist
+        dist = torch.norm(centers.unsqueeze(2) - centers.unsqueeze(1), dim=-1)  # [B, Q, Q]
+        return -dist
 
 
 class SparseBEVSampling(BaseModule):

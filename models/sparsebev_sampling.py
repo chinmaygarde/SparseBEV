@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from .bbox.utils import decode_bbox
 from .utils import rotation_3d_in_axis, DUMP
-from .csrc.wrapper import msmv_sampling, msmv_sampling_pytorch
+from .csrc.wrapper import msmv_sampling, msmv_sampling_pytorch, msmv_sampling_onnx, MSMV_CUDA
 
 
 def make_sample_points(query_bbox, offset, pc_range):
@@ -88,38 +88,55 @@ def sampling_4d(sample_points, mlvl_feats, scale_weights, lidar2img, image_h, im
     valid_mask = valid_mask.permute(0, 1, 3, 4, 2)  # [B, T, Q, GP, N]
     sample_points_cam = sample_points_cam.permute(0, 1, 3, 4, 2, 5)  # [B, T, Q, GP, N, 2]
 
-    # prepare batched indexing
-    i_batch = torch.arange(B, dtype=torch.long, device=sample_points.device)
-    i_query = torch.arange(Q, dtype=torch.long, device=sample_points.device)
-    i_time = torch.arange(T, dtype=torch.long, device=sample_points.device)
-    i_point = torch.arange(G * P, dtype=torch.long, device=sample_points.device)
-    i_batch = i_batch.view(B, 1, 1, 1, 1).expand(B, T, Q, G * P, 1)
-    i_time = i_time.view(1, T, 1, 1, 1).expand(B, T, Q, G * P, 1)
-    i_query = i_query.view(1, 1, Q, 1, 1).expand(B, T, Q, G * P, 1)
-    i_point = i_point.view(1, 1, 1, G * P, 1).expand(B, T, Q, G * P, 1)
-    
     # we only keep at most one valid sampling point, see https://zhuanlan.zhihu.com/p/654821380
-    i_view = torch.argmax(valid_mask, dim=-1)[..., None]  # [B, T, Q, GP, 1]
+    i_view = torch.argmax(valid_mask, dim=-1, keepdim=True)  # [B, T, Q, GP, 1]
 
-    # index the only one sampling point and its valid flag
-    sample_points_cam = sample_points_cam[i_batch, i_time, i_query, i_point, i_view, :]  # [B, Q, GP, 1, 2]
-    valid_mask = valid_mask[i_batch, i_time, i_query, i_point, i_view]  # [B, Q, GP, 1]
+    if MSMV_CUDA:
+        # Original fancy-indexing path (used with CUDA kernel on Linux/Windows)
+        i_batch = torch.arange(B, dtype=torch.long, device=sample_points.device)
+        i_query = torch.arange(Q, dtype=torch.long, device=sample_points.device)
+        i_time = torch.arange(T, dtype=torch.long, device=sample_points.device)
+        i_point = torch.arange(G * P, dtype=torch.long, device=sample_points.device)
+        i_batch = i_batch.view(B, 1, 1, 1, 1).expand(B, T, Q, G * P, 1)
+        i_time = i_time.view(1, T, 1, 1, 1).expand(B, T, Q, G * P, 1)
+        i_query = i_query.view(1, 1, Q, 1, 1).expand(B, T, Q, G * P, 1)
+        i_point = i_point.view(1, 1, 1, G * P, 1).expand(B, T, Q, G * P, 1)
 
-    # treat the view index as a new axis for grid_sample and normalize the view index to [0, 1]
-    sample_points_cam = torch.cat([sample_points_cam, i_view[..., None].float() / (N - 1)], dim=-1)
+        sample_points_cam = sample_points_cam[i_batch, i_time, i_query, i_point, i_view, :]
+        valid_mask = valid_mask[i_batch, i_time, i_query, i_point, i_view]
 
-    # reorganize the tensor to stack T and G to the batch dim for better parallelism
-    sample_points_cam = sample_points_cam.reshape(B, T, Q, G, P, 1, 3)
-    sample_points_cam = sample_points_cam.permute(0, 1, 3, 2, 4, 5, 6)  # [B, T, G, Q, P, 1, 3]
-    sample_points_cam = sample_points_cam.reshape(B*T*G, Q, P, 3)
+        # treat the view index as a new axis for grid_sample, normalise to [0, 1]
+        sample_points_cam = torch.cat([sample_points_cam, i_view[..., None].float() / (N - 1)], dim=-1)
 
-    # reorganize the tensor to stack T and G to the batch dim for better parallelism
-    scale_weights = scale_weights.reshape(B, Q, G, T, P, -1)
-    scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
-    scale_weights = scale_weights.reshape(B*G*T, Q, P, -1)
+        sample_points_cam = sample_points_cam.reshape(B, T, Q, G, P, 1, 3)
+        sample_points_cam = sample_points_cam.permute(0, 1, 3, 2, 4, 5, 6)
+        sample_points_cam = sample_points_cam.reshape(B*T*G, Q, P, 3)
 
-    # multi-scale multi-view grid sample
-    final = msmv_sampling(mlvl_feats, sample_points_cam, scale_weights)
+        scale_weights = scale_weights.reshape(B, Q, G, T, P, -1)
+        scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
+        scale_weights = scale_weights.reshape(B*G*T, Q, P, -1)
+
+        final = msmv_sampling(mlvl_feats, sample_points_cam, scale_weights)
+    else:
+        # ONNX-compatible path: torch.gather + 4D grid_sample (no custom CUDA ops)
+        # Select best-view UV coords via gather  [B, T, Q, GP, 1, 2]
+        i_view_uv = i_view.unsqueeze(-1).expand(B, T, Q, G * P, 1, 2)
+        sample_points_cam = torch.gather(sample_points_cam, 4, i_view_uv).squeeze(4)  # [B, T, Q, GP, 2]
+
+        # Reorganize UV to [B*T*G, Q, P, 2]
+        sample_points_cam = sample_points_cam.reshape(B, T, Q, G, P, 2)
+        sample_points_cam = sample_points_cam.permute(0, 1, 3, 2, 4, 5)  # [B, T, G, Q, P, 2]
+        sample_points_cam = sample_points_cam.reshape(B*T*G, Q, P, 2)
+
+        # Reorganize view_idx to [B*T*G, Q, P]
+        i_view = i_view.squeeze(4).reshape(B, T, Q, G, P)
+        i_view = i_view.permute(0, 1, 3, 2, 4).reshape(B*T*G, Q, P)
+
+        scale_weights = scale_weights.reshape(B, Q, G, T, P, -1)
+        scale_weights = scale_weights.permute(0, 2, 3, 1, 4, 5)
+        scale_weights = scale_weights.reshape(B*G*T, Q, P, -1)
+
+        final = msmv_sampling_onnx(mlvl_feats, sample_points_cam, i_view, scale_weights)
 
     # reorganize the sampled features
     C = final.shape[2]  # [BTG, Q, C, P]

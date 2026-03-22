@@ -169,6 +169,72 @@ Visualize the sampling points (like Fig. 6 in the paper):
 python viz_sample_points.py --config configs/r50_nuimg_704x256.py --weights checkpoints/r50_nuimg_704x256.pth
 ```
 
+## Changes from upstream
+
+This fork adds ONNX export support targeting [ONNX Runtime's CoreML Execution Provider](https://onnxruntime.ai/docs/execution-providers/CoreML-ExecutionProvider.html) for inference on Apple Silicon (Mac Studio).
+
+### Dependency management
+
+- `pyproject.toml` / `uv.lock` — project dependencies managed with [uv](https://docs.astral.sh/uv/)
+- `justfile` — task runner for common operations
+
+### ONNX export
+
+Three code changes were required to make the model traceable with `torch.onnx.export`:
+
+**`models/sparsebev_sampling.py`** — `sampling_4d()`
+- Replaced 6-dimensional advanced tensor indexing (not supported by the ONNX tracer) with `torch.gather` for best-view selection
+
+**`models/csrc/wrapper.py`** — new `msmv_sampling_onnx()`
+- Added an ONNX-compatible sampling path that uses 4D `F.grid_sample` (ONNX opset 16+) and `torch.gather` for view selection, replacing the original 5D volumetric `grid_sample` which is not in the ONNX spec
+- The existing CUDA kernel path (`msmv_sampling` / `msmv_sampling_pytorch`) is preserved and used when CUDA is available
+
+**`models/sparsebev_transformer.py`**
+- `SparseBEVTransformerDecoder.forward()`: added a fast path that accepts pre-computed `time_diff` and `lidar2img` tensors directly, bypassing the NumPy preprocessing that is not traceable
+- `SparseBEVTransformerDecoderLayer.forward()`: replaced a masked in-place assignment (`tensor[mask] = value`) with `torch.where`, which is ONNX-compatible
+- `SparseBEVSelfAttention.calc_bbox_dists()`: replaced a Python loop over the batch dimension with a vectorised `torch.norm` using broadcasting
+
+### New files
+
+| File | Purpose |
+|------|---------|
+| `export_onnx.py` | Exports the model to ONNX, runs ORT CPU + CoreML EP validation |
+| `models/onnx_wrapper.py` | Thin `nn.Module` wrapper that accepts pre-computed tensors instead of `img_metas` dicts |
+| `justfile` | `just onnx_export` / `just onnx_export_validate` |
+| `exports/` | ONNX model files tracked via Git LFS |
+
+### Running the export
+
+```bash
+just onnx_export
+# or with validation against PyTorch and CoreML EP:
+just onnx_export_validate
+```
+
+Exported models land in `exports/` as `sparsebev_{config}_opset{N}.onnx` (+ `.onnx.data` for weights).
+
+**Inference with ONNX Runtime:**
+
+```python
+import onnxruntime as ort
+sess = ort.InferenceSession(
+    'exports/sparsebev_r50_nuimg_704x256_400q_36ep_opset18.onnx',
+    providers=[('CoreMLExecutionProvider', {'MLComputeUnits': 'ALL'}),
+               'CPUExecutionProvider'],
+)
+cls_scores, bbox_preds = sess.run(None, {
+    'img':       img_np,        # [1, 48, 3, 256, 704] float32 BGR
+    'lidar2img': lidar2img_np,  # [1, 48, 4, 4] float32
+    'time_diff': time_diff_np,  # [1, 8]  float32, seconds since frame 0
+})
+# cls_scores: [6, 1, 400, 10]  raw logits per decoder layer
+# bbox_preds: [6, 1, 400, 10]  raw box params — decode with NMSFreeCoder
+```
+
+The `MLComputeUnits` option must be passed explicitly; without it ONNX Runtime discards the CoreML EP on the first unsupported partition instead of falling back per-node.
+
+---
+
 ## Acknowledgements
 
 Many thanks to these excellent open-source projects:

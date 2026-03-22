@@ -51,3 +51,4 @@ checkpoints
 pretrain
 *.png
 *.jpg
+.claude/settings.local.json
